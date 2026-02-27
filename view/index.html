@@ -1,0 +1,886 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Admin UI — FastAPI</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { padding: 1.5rem; }
+    .table-responsive { max-height: 420px; overflow:auto; }
+    .form-section { background:#f8f9fa; padding:15px; border-radius:8px; }
+    .error-box { display:none; }
+    .loading { opacity: 0.6; pointer-events: none; }
+    .btn:disabled { cursor: not-allowed; }
+    .pagination { margin: 0; }
+    .search-box { background: #fff3cd; padding: 10px; border-radius: 5px; margin-bottom: 15px; }
+    .query-section { background: #e7f3ff; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1 class="mb-3">Приложение для управления работниками</h1>
+  <p class="text-muted">Управление таблицами</p>
+
+  <!-- Табсы -->
+  <ul class="nav nav-tabs" id="entityTabs" role="tablist">
+    <li class="nav-item"><button class="nav-link active" data-entity="departments">Подразделения</button></li>
+    <li class="nav-item"><button class="nav-link" data-entity="employees">Работники</button></li>
+    <li class="nav-item"><button class="nav-link" data-entity="positions">Позиции</button></li>
+    <li class="nav-item"><button class="nav-link" data-entity="schedule">Расписание</button></li>
+    <li class="nav-item"><button class="nav-link" data-entity="workhistory">История работы</button></li>
+    <li class="nav-item"><button class="nav-link" data-entity="queries">Запросы</button></li>
+  </ul>
+
+  <div class="alert alert-danger error-box" id="errorBox"></div>
+  <div class="alert alert-success" id="successBox" style="display:none"></div>
+
+  <div class="card mt-3">
+    <div class="card-body" id="entityArea"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+const BASE_URL = "";
+
+// Поля для каждой сущности
+const ENTITY_FIELDS = {
+  departments: ["name"],
+  employees: ["full_name", "birth_date", "gender", "marital_status"],
+  positions: ["name", "short_name", "code", "grade_min", "grade_max"],
+  schedule: ["department_id", "position_id", "num"],
+  workhistory: ["employee_id", "department_id", "position_id", "grade", "start_date", "end_date"],
+  queries: []
+};
+
+// Поисковые поля для каждой сущности (с учетом доступных endpoint'ов)
+const SEARCH_FIELDS = {
+  departments: ["id", "name"],
+  employees: ["id", "full_name"],
+  positions: ["id", "name"],
+  schedule: ["id"],
+  workhistory: ["id"],
+  queries: []
+};
+
+// Специальные endpoint'ы для поиска по полям (кроме id)
+const SEARCH_ENDPOINTS = {
+  departments: {
+    name: "by-name"
+  },
+  employees: {
+    full_name: "by-full-name"
+  },
+  positions: {
+    name: "by-name"
+  },
+  queries: {}
+};
+
+// Сопоставление сущность → ресурс API
+function resourceName(entity){
+  return {
+    departments: "department",
+    employees: "employee",
+    positions: "position",
+    schedule: "schedule",
+    workhistory: "workhistory",
+    queries: "queries"
+  }[entity];
+}
+
+// Универсальная функция API запросов
+function api(method, url, data = null) {
+  const opts = { 
+    method, 
+    headers: {}
+  };
+  
+  if (data) { 
+    opts.headers["Content-Type"] = "application/json"; 
+    opts.body = JSON.stringify(data); 
+  }
+  
+  return fetch(BASE_URL + url, opts).then(async r => {
+    const text = await r.text();
+    let json;
+    try { 
+      json = text ? JSON.parse(text) : {}; 
+    } catch { 
+      json = { detail: text }; 
+    }
+    
+    if (!r.ok) {
+      // Если это ошибка валидации Pydantic
+      if (json.detail && Array.isArray(json.detail)) {
+        const errors = json.detail.map(err => `${err.loc[1]}: ${err.msg}`).join(', ');
+        throw new Error(`Validation error: ${errors}`);
+      }
+      throw new Error(json.detail || `HTTP error ${r.status}`);
+    }
+    return json;
+  });
+}
+
+// Функции сообщений
+function msgError(text){ 
+  const b = document.getElementById("errorBox"); 
+  b.style.display = "block"; 
+  b.textContent = text; 
+}
+
+function msgSuccess(text){ 
+  const b = document.getElementById("successBox"); 
+  b.style.display = "block"; 
+  b.textContent = text; 
+  setTimeout(() => b.style.display = "none", 2500);
+}
+
+// Управление состоянием загрузки
+function setLoading(loading) {
+  const area = document.getElementById("entityArea");
+  const buttons = area.querySelectorAll('[data-act]');
+  
+  if (loading) {
+    area.classList.add('loading');
+    buttons.forEach(btn => {
+      const originalText = btn.innerHTML;
+      btn.setAttribute('data-original-text', originalText);
+      btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Загрузка...';
+      btn.disabled = true;
+    });
+  } else {
+    area.classList.remove('loading');
+    buttons.forEach(btn => {
+      const originalText = btn.getAttribute('data-original-text');
+      if (originalText) {
+        btn.innerHTML = originalText;
+      }
+      btn.disabled = false;
+    });
+  }
+}
+
+// Рендер полей формы
+function renderFields(fields, prefix = "create_") {
+  return fields.map(f => {
+    let type = "text";
+    let placeholder = "";
+    
+    if (f.endsWith("_id") || ["grade", "grade_min", "grade_max", "num"].includes(f)) {
+      type = "number";
+      placeholder = "Число";
+    } else if (f.endsWith("_date")) {
+      type = "date";
+    }
+    
+    return `<div class="mb-2">
+      <label class="form-label">${f.replace(/_/g, ' ').toUpperCase()}</label>
+      <input class="form-control" type="${type}" data-field="${prefix}${f}" placeholder="${placeholder}" />
+    </div>`;
+  }).join("");
+}
+
+// Рендер панели запросов
+function renderQueriesPanel() {
+  return `
+  <div class="row">
+    <div class="col-12">
+      <h4>Специальные запросы</h4>
+      
+      <!-- Запрос 1: Информация по отделу -->
+      <div class="query-section">
+        <h5>1. Информация по отделу</h5>
+        <p class="text-muted">Получить информацию о должностях и грейдах в отделе</p>
+        <div class="row">
+          <div class="col-md-4">
+            <div class="mb-3">
+              <label class="form-label">ID отдела</label>
+              <input class="form-control" type="number" data-field="query_department_id" placeholder="Введите ID отдела" />
+            </div>
+            <button class="btn btn-primary" data-act="query_department">Выполнить запрос</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Запрос 2: Сотрудники выходящие на пенсию в этом году женского пола -->
+      <div class="query-section">
+        <h5>2. Сотрудники выходящие на пенсию в этом году женского пола</h5>
+        <p class="text-muted">Найти сотрудников, которые выходят на пенсию в этом году женского пола относительно даты</p>
+        <div class="row">
+          <div class="col-md-4">
+            <div class="mb-3">
+              <label class="form-label">Дата</label>
+              <input class="form-control" type="date" data-field="query_pension_date" />
+            </div>
+            <button class="btn btn-primary" data-act="query_pension">Выполнить запрос</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Запрос 3: Сотрудники по возрасту и должности -->
+      <div class="query-section">
+        <h5>3. Сотрудники по возрасту и должности</h5>
+        <p class="text-muted">Найти сотрудников определенного возраста на указанной должности</p>
+        <div class="row">
+          <div class="col-md-4">
+            <div class="mb-3">
+              <label class="form-label">Возраст</label>
+              <input class="form-control" type="number" data-field="query_age" placeholder="Введите возраст" />
+            </div>
+            <div class="mb-3">
+              <label class="form-label">ID должности</label>
+              <input class="form-control" type="number" data-field="query_position_id" placeholder="Введите ID должности" />
+            </div>
+            <button class="btn btn-primary" data-act="query_age">Выполнить запрос</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Результаты запросов -->
+      <div class="mt-4">
+        <h5>Результаты запроса</h5>
+        <div class="table-responsive">
+          <table class="table table-bordered table-striped">
+            <thead class="table-dark">
+              <tr id="queryTableHeader"></tr>
+            </thead>
+            <tbody id="queryTbl"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+// Рендер полей поиска
+function renderSearchFields(entity) {
+  const fields = SEARCH_FIELDS[entity];
+  return fields.map(f => {
+    let type = "text";
+    if (f.endsWith("_id") || f === "id") type = "number";
+    
+    return `<option value="${f}">${f.replace(/_/g, ' ').toUpperCase()}</option>`;
+  }).join("");
+}
+
+// Рендер пагинации
+function renderPagination(currentPage, totalPages) {
+  if (totalPages <= 1) return '';
+  
+  let pagination = '';
+  const maxVisible = 5;
+  let startPage = Math.max(1, currentPage - Math.floor(maxVisible / 2));
+  let endPage = Math.min(totalPages, startPage + maxVisible - 1);
+  
+  if (endPage - startPage + 1 < maxVisible) {
+    startPage = Math.max(1, endPage - maxVisible + 1);
+  }
+  
+  // Кнопка "Назад"
+  pagination += `<li class="page-item ${currentPage === 1 ? 'disabled' : ''}">
+    <a class="page-link" href="#" data-page="${currentPage - 1}">Назад</a>
+  </li>`;
+  
+  // Первая страница
+  if (startPage > 1) {
+    pagination += `<li class="page-item"><a class="page-link" href="#" data-page="1">1</a></li>`;
+    if (startPage > 2) pagination += `<li class="page-item disabled"><span class="page-link">...</span></li>`;
+  }
+  
+  // Страницы
+  for (let i = startPage; i <= endPage; i++) {
+    pagination += `<li class="page-item ${i === currentPage ? 'active' : ''}">
+      <a class="page-link" href="#" data-page="${i}">${i}</a>
+    </li>`;
+  }
+  
+  // Последняя страница
+  if (endPage < totalPages) {
+    if (endPage < totalPages - 1) pagination += `<li class="page-item disabled"><span class="page-link">...</span></li>`;
+    pagination += `<li class="page-item"><a class="page-link" href="#" data-page="${totalPages}">${totalPages}</a></li>`;
+  }
+  
+  // Кнопка "Вперед"
+  pagination += `<li class="page-item ${currentPage === totalPages ? 'disabled' : ''}">
+    <a class="page-link" href="#" data-page="${currentPage + 1}">Вперед</a>
+  </li>`;
+  
+  return `<nav><ul class="pagination">${pagination}</ul></nav>`;
+}
+
+// Рендер панели управления
+function renderPanel(entity) {
+  if (entity === "queries") {
+    return renderQueriesPanel();
+  }
+  
+  const fields = ENTITY_FIELDS[entity];
+  const searchFields = SEARCH_FIELDS[entity];
+  
+  return `
+  <div class="row">
+    <div class="col-md-8">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <button class="btn btn-primary" data-act="list">Показать все записи</button>
+        <div class="d-flex gap-2">
+          <select class="form-select" style="width: auto;" data-field="search_field">
+            ${renderSearchFields(entity)}
+          </select>
+          <input class="form-control" type="text" placeholder="Значение для поиска" data-field="search_value" style="width: 200px;" />
+          <button class="btn btn-info" data-act="search">Поиск</button>
+        </div>
+      </div>
+      
+      <div class="search-box" id="searchInfo" style="display: none;">
+        <strong>Результаты поиска:</strong> 
+        <span id="searchCriteria"></span>
+        <button class="btn btn-sm btn-outline-secondary ms-2" data-act="clear-search">Очистить</button>
+      </div>
+      
+      <div class="table-responsive">
+        <table class="table table-bordered table-striped">
+          <thead class="table-dark">
+            <tr id="tableHeader"></tr>
+          </thead>
+          <tbody id="tbl"></tbody>
+        </table>
+      </div>
+      
+      <div class="d-flex justify-content-between align-items-center mt-3">
+        <div>
+          <select class="form-select" data-field="page_size" style="width: auto;">
+            <option value="10">10 на странице</option>
+            <option value="25">25 на странице</option>
+            <option value="50">50 на странице</option>
+            <option value="100">100 на странице</option>
+          </select>
+        </div>
+        <div id="pagination"></div>
+        <div class="text-muted" id="pageInfo"></div>
+      </div>
+    </div>
+    
+    <div class="col-md-4">
+      <div class="form-section">
+        <h5>Создание записи</h5>
+        ${renderFields(fields)}
+        <button class="btn btn-success w-100 mt-2" data-act="create">Создать</button>
+      </div>
+      
+      <div class="form-section mt-3">
+        <h5>Операции с конкретной записью</h5>
+        <div class="input-group mb-2">
+          <input class="form-control" placeholder="Введите ID" data-field="id" type="number" />
+          <button class="btn btn-info" data-act="getbyid">Найти по ID</button>
+        </div>
+        ${renderFields(fields, "upd_")}
+        <button class="btn btn-warning w-100 mt-2" data-act="update">Обновить</button>
+        <button class="btn btn-danger w-100 mt-2" data-act="delete">Удалить</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// Рендер таблицы
+function renderTable(rows) {
+  const tbl = document.getElementById("tbl");
+  const header = document.getElementById("tableHeader");
+  
+  if (!rows || !rows.length) { 
+    header.innerHTML = '';
+    tbl.innerHTML = '<tr><td class="text-center" colspan="10">Нет данных</td></tr>'; 
+    return; 
+  }
+  
+  const keys = Object.keys(rows[0]);
+  header.innerHTML = keys.map(k => `<th>${k.toUpperCase()}</th>`).join('');
+  
+  tbl.innerHTML = rows.map(row => 
+    '<tr>' + keys.map(k => `<td>${row[k] ?? ''}</td>`).join('') + '</tr>'
+  ).join('');
+}
+
+// Рендер таблицы запросов
+function renderQueryTable(rows) {
+  const tbl = document.getElementById("queryTbl");
+  const header = document.getElementById("queryTableHeader");
+  
+  if (!rows || !rows.length) { 
+    header.innerHTML = '';
+    tbl.innerHTML = '<tr><td class="text-center" colspan="10">Нет данных</td></tr>'; 
+    return; 
+  }
+  
+  const keys = Object.keys(rows[0]);
+  header.innerHTML = keys.map(k => `<th>${k.replace(/_/g, ' ').toUpperCase()}</th>`).join('');
+  
+  tbl.innerHTML = rows.map(row => 
+    '<tr>' + keys.map(k => `<td>${row[k] ?? ''}</td>`).join('') + '</tr>'
+  ).join('');
+}
+
+// Сбор данных полей
+function collectFields(entity, prefix) {
+  const fields = ENTITY_FIELDS[entity];
+  const area = document.getElementById("entityArea");
+  const out = {};
+  
+  fields.forEach(k => {
+    const el = area.querySelector(`[data-field="${prefix}${k}"]`);
+    if (!el) return;
+    
+    let value = el.value.trim();
+    if (value === "") return;
+    
+    // Преобразование типов данных
+    if (k.endsWith("_id") || ["grade", "grade_min", "grade_max", "num"].includes(k)) {
+      value = Number(value);
+      if (isNaN(value)) {
+        throw new Error(`Поле ${k} должно быть числом`);
+      }
+    }
+    
+    out[k] = value;
+  });
+  
+  return out;
+}
+
+// Очистка полей формы
+function clearFields(entity, prefix) {
+  const fields = ENTITY_FIELDS[entity];
+  const area = document.getElementById("entityArea");
+  
+  fields.forEach(k => {
+    const el = area.querySelector(`[data-field="${prefix}${k}"]`);
+    if (el) el.value = "";
+  });
+}
+
+// Заполнение полей формы данными
+function fillFields(entity, data, prefix) {
+  const fields = ENTITY_FIELDS[entity];
+  const area = document.getElementById("entityArea");
+  
+  fields.forEach(k => {
+    const el = area.querySelector(`[data-field="${prefix}${k}"]`);
+    if (el && data[k] !== undefined && data[k] !== null) {
+      // Форматирование дат для input type="date"
+      if (k.endsWith('_date') && data[k]) {
+        const date = new Date(data[k]);
+        if (!isNaN(date)) {
+          el.value = date.toISOString().split('T')[0];
+          return;
+        }
+      }
+      el.value = data[k];
+    }
+  });
+}
+
+// Состояние пагинации для каждой сущности
+const paginationState = {
+  departments: { currentPage: 1, pageSize: 10, totalPages: 1, totalItems: 0, searchField: null, searchValue: null },
+  employees: { currentPage: 1, pageSize: 10, totalPages: 1, totalItems: 0, searchField: null, searchValue: null },
+  positions: { currentPage: 1, pageSize: 10, totalPages: 1, totalItems: 0, searchField: null, searchValue: null },
+  schedule: { currentPage: 1, pageSize: 10, totalPages: 1, totalItems: 0, searchField: null, searchValue: null },
+  workhistory: { currentPage: 1, pageSize: 10, totalPages: 1, totalItems: 0, searchField: null, searchValue: null },
+  queries: { currentPage: 1, pageSize: 10, totalPages: 1, totalItems: 0, searchField: null, searchValue: null }
+};
+
+// Функция для формирования URL поиска с учетом особенностей роутеров
+function buildSearchUrl(entity, searchField, searchValue, page, pageSize) {
+  const resource = resourceName(entity);
+  
+  // Поиск по ID - отдельный endpoint
+  if (searchField === 'id') {
+    return `/${resource}/${searchValue}`;
+  }
+  
+  // Поиск по другим полям - используем специальные endpoint'ы
+  const searchEndpoint = SEARCH_ENDPOINTS[entity]?.[searchField];
+  if (searchEndpoint) {
+    return `/${resource}/${searchEndpoint}?${searchField}=${encodeURIComponent(searchValue)}`;
+  }
+  
+  // Если нет специального endpoint'а, используем пагинацию с фильтрацией на клиенте
+  return `/${resource}/?num=${pageSize}&start=${(page - 1) * pageSize}`;
+}
+
+// Загрузка данных с пагинацией
+async function loadData(entity, page = 1, pageSize = 10, searchField = null, searchValue = null) {
+  const resource = resourceName(entity);
+  const state = paginationState[entity];
+  
+  let url = buildSearchUrl(entity, searchField, searchValue, page, pageSize);
+  let data;
+  
+  try {
+    // Если это поиск по ID
+    if (searchField === 'id' && searchValue) {
+      try {
+        data = await api("GET", url);
+        // Обернем в массив для совместимости с таблицей
+        const resultArray = [data];
+        renderTable(resultArray);
+        document.getElementById("searchInfo").style.display = "block";
+        document.getElementById("searchCriteria").textContent = `ID = ${searchValue} (найдена 1 запись)`;
+        
+        // Обновляем состояние пагинации для поиска по ID
+        state.currentPage = 1;
+        state.totalPages = 1;
+        state.totalItems = 1;
+        state.searchField = searchField;
+        state.searchValue = searchValue;
+        
+        updatePaginationUI(entity);
+        return;
+      } catch (error) {
+        if (error.message.includes('404') || error.message.includes('не найден')) {
+          renderTable([]);
+          document.getElementById("searchInfo").style.display = "block";
+          document.getElementById("searchCriteria").textContent = `ID = ${searchValue} (не найдено)`;
+          state.totalItems = 0;
+          updatePaginationUI(entity);
+          return;
+        }
+        throw error;
+      }
+    }
+    
+    // Если это поиск по специальному endpoint'у (name, full_name и т.д.)
+    const searchEndpoint = SEARCH_ENDPOINTS[entity]?.[searchField];
+    if (searchField && searchValue && searchEndpoint) {
+      try {
+        data = await api("GET", url);
+        document.getElementById("searchInfo").style.display = "block";
+        document.getElementById("searchCriteria").textContent = `${searchField} = "${searchValue}" (найдено ${data.length} записей)`;
+        renderTable(data);
+        
+        // Для поиска без пагинации
+        state.currentPage = 1;
+        state.totalPages = 1;
+        state.totalItems = data.length;
+        state.searchField = searchField;
+        state.searchValue = searchValue;
+      } catch (error) {
+        // Если endpoint не существует, фильтруем на клиенте
+        if (error.message.includes('404') || error.message.includes('Not Found')) {
+          const allData = await api("GET", `/${resource}`);
+          const filteredData = allData.filter(item => {
+            const value = item[searchField];
+            if (value === null || value === undefined) return false;
+            return value.toString().toLowerCase().includes(searchValue.toLowerCase());
+          });
+          
+          document.getElementById("searchInfo").style.display = "block";
+          document.getElementById("searchCriteria").textContent = `${searchField} содержит "${searchValue}" (найдено ${filteredData.length} записей)`;
+          renderTable(filteredData);
+          
+          state.currentPage = 1;
+          state.totalPages = 1;
+          state.totalItems = filteredData.length;
+          state.searchField = searchField;
+          state.searchValue = searchValue;
+        } else {
+          throw error;
+        }
+      }
+    } else if (searchField && searchValue) {
+      // Если поле поиска есть, но нет специального endpoint'а, фильтруем на клиенте
+      const allData = await api("GET", `/${resource}`);
+      const filteredData = allData.filter(item => {
+        const value = item[searchField];
+        if (value === null || value === undefined) return false;
+        return value.toString().toLowerCase().includes(searchValue.toLowerCase());
+      });
+      
+      document.getElementById("searchInfo").style.display = "block";
+      document.getElementById("searchCriteria").textContent = `${searchField} содержит "${searchValue}" (найдено ${filteredData.length} записей)`;
+      renderTable(filteredData);
+      
+      state.currentPage = 1;
+      state.totalPages = 1;
+      state.totalItems = filteredData.length;
+      state.searchField = searchField;
+      state.searchValue = searchValue;
+    } else {
+      // Обычный список с пагинацией
+      data = await api("GET", url);
+      document.getElementById("searchInfo").style.display = "none";
+      renderTable(data);
+      
+      // В реальном API должен возвращаться общее количество для пагинации
+      // Здесь используем предположение, что если данных меньше чем pageSize, то это последняя страница
+      state.currentPage = page;
+      state.pageSize = pageSize;
+      state.totalItems = data.length < pageSize ? (page - 1) * pageSize + data.length : (page * pageSize) + 1;
+      state.totalPages = Math.ceil(state.totalItems / pageSize);
+      state.searchField = null;
+      state.searchValue = null;
+    }
+    
+    updatePaginationUI(entity);
+  } catch (error) {
+    throw error;
+  }
+}
+
+// Обновление UI пагинации
+function updatePaginationUI(entity) {
+  const state = paginationState[entity];
+  const paginationElement = document.getElementById("pagination");
+  const pageInfoElement = document.getElementById("pageInfo");
+  
+  paginationElement.innerHTML = renderPagination(state.currentPage, state.totalPages);
+  
+  const startItem = (state.currentPage - 1) * state.pageSize + 1;
+  const endItem = Math.min(state.currentPage * state.pageSize, state.totalItems);
+  pageInfoElement.textContent = `Записи ${startItem}-${endItem} из ${state.totalItems}`;
+  
+  // Прикрепляем обработчики для пагинации
+  paginationElement.querySelectorAll('.page-link').forEach(link => {
+    link.onclick = (e) => {
+      e.preventDefault();
+      const page = parseInt(link.dataset.page);
+      if (page >= 1 && page <= state.totalPages) {
+        loadData(entity, page, state.pageSize, state.searchField, state.searchValue);
+      }
+    };
+  });
+}
+
+// Выполнение специальных запросов
+async function executeQuery(queryType) {
+  const area = document.getElementById("entityArea");
+  
+  try {
+    setLoading(true);
+    let url = '';
+    
+    switch(queryType) {
+      case 'query_department':
+        const departmentId = area.querySelector('[data-field="query_department_id"]').value.trim();
+        if (!departmentId) throw new Error("Введите ID отдела");
+        url = `/queries_department/${departmentId}`;
+        break;
+        
+      case 'query_pension':
+        const pensionDate = area.querySelector('[data-field="query_pension_date"]').value;
+        if (!pensionDate) throw new Error("Выберите дату");
+        // Форматируем дату в формат YYYY-MM-DD
+        url = `/queries_pension/${pensionDate}`;
+        break;
+        
+      case 'query_age':
+        const age = area.querySelector('[data-field="query_age"]').value.trim();
+        const positionId = area.querySelector('[data-field="query_position_id"]').value.trim();
+        if (!age) throw new Error("Введите возраст");
+        if (!positionId) throw new Error("Введите ID должности");
+        url = `/queries_age/?age=${age}&position_id=${positionId}`;
+        break;
+    }
+    
+    const data = await api("GET", url);
+    renderQueryTable(data);
+    msgSuccess(`Запрос выполнен успешно. Найдено записей: ${data.length}`);
+    
+  } catch (err) {
+    msgError(err.message || "Произошла ошибка при выполнении запроса");
+  } finally {
+    setLoading(false);
+  }
+}
+
+// Прикрепление событий
+function attach(entity) {
+  const area = document.getElementById("entityArea");
+  
+  if (entity === "queries") {
+    // Обработчики для запросов
+    area.querySelectorAll('[data-act]').forEach(btn => {
+      btn.onclick = async () => {
+        document.getElementById("errorBox").style.display = "none";
+        document.getElementById("successBox").style.display = "none";
+        
+        const action = btn.dataset.act;
+        if (action.startsWith('query_')) {
+          await executeQuery(action);
+        }
+      };
+    });
+    return;
+  }
+  
+  const resource = resourceName(entity);
+  
+  // Инициализация состояния пагинации
+  const pageSizeSelect = area.querySelector('[data-field="page_size"]');
+  if (pageSizeSelect) {
+    pageSizeSelect.value = paginationState[entity].pageSize;
+    pageSizeSelect.onchange = () => {
+      const newSize = parseInt(pageSizeSelect.value);
+      paginationState[entity].pageSize = newSize;
+      loadData(entity, 1, newSize);
+    };
+  }
+  
+  // Автоматическое изменение типа поля ввода для поиска
+  const searchFieldSelect = area.querySelector('[data-field="search_field"]');
+  const searchValueInput = area.querySelector('[data-field="search_value"]');
+  
+  if (searchFieldSelect && searchValueInput) {
+    searchFieldSelect.onchange = () => {
+      const fieldType = searchFieldSelect.value;
+      if (fieldType === 'id') {
+        searchValueInput.type = 'number';
+        searchValueInput.placeholder = 'Введите число';
+      } else {
+        searchValueInput.type = 'text';
+        searchValueInput.placeholder = 'Введите текст для поиска';
+      }
+    };
+    
+    // Установим начальный тип
+    if (searchFieldSelect.value === 'id') {
+      searchValueInput.type = 'number';
+      searchValueInput.placeholder = 'Введите число';
+    } else {
+      searchValueInput.type = 'text';
+      searchValueInput.placeholder = 'Введите текст для поиска';
+    }
+  }
+  
+  area.querySelectorAll('[data-act]').forEach(btn => {
+    btn.onclick = async () => {
+      // Сброс сообщений
+      document.getElementById("errorBox").style.display = "none";
+      document.getElementById("successBox").style.display = "none";
+      
+      try {
+        setLoading(true);
+        const id = area.querySelector('[data-field="id"]')?.value.trim();
+        
+        switch(btn.dataset.act) {
+          case "list":
+            await loadData(entity, 1, paginationState[entity].pageSize);
+            msgSuccess("Список загружен");
+            break;
+            
+          case "search":
+            const searchField = area.querySelector('[data-field="search_field"]').value;
+            const searchValue = area.querySelector('[data-field="search_value"]').value.trim();
+            if (!searchValue) {
+              throw new Error("Введите значение для поиска");
+            }
+            
+            // Валидация для числовых полей
+            if (searchField === 'id' && isNaN(Number(searchValue))) {
+              throw new Error("Для поиска по ID необходимо ввести число");
+            }
+            
+            await loadData(entity, 1, paginationState[entity].pageSize, searchField, searchValue);
+            break;
+            
+          case "clear-search":
+            await loadData(entity, 1, paginationState[entity].pageSize);
+            area.querySelector('[data-field="search_value"]').value = "";
+            break;
+            
+          case "getbyid":
+            if (!id) throw new Error("Введите ID для поиска");
+            if (isNaN(Number(id))) {
+              throw new Error("ID должен быть числом");
+            }
+            const singleData = await api("GET", `/${resource}/${id}`);
+            renderTable([singleData]);
+            fillFields(entity, singleData, "upd_");
+            msgSuccess("Данные загружены в таблицу и форму обновления");
+            break;
+            
+          case "create":
+            const createData = collectFields(entity, "create_");
+            if (Object.keys(createData).length === 0) {
+              throw new Error("Заполните хотя бы одно поле для создания");
+            }
+            await api("POST", `/${resource}`, createData);
+            msgSuccess("Запись успешно создана");
+            clearFields(entity, "create_");
+            // Перезагружаем данные
+            await loadData(entity, paginationState[entity].currentPage, paginationState[entity].pageSize);
+            break;
+            
+          case "update":
+            if (!id) throw new Error("Введите ID для обновления");
+            if (isNaN(Number(id))) {
+              throw new Error("ID должен быть числом");
+            }
+            const updateData = collectFields(entity, "upd_");
+            if (Object.keys(updateData).length === 0) {
+              throw new Error("Заполните хотя бы одно поле для обновления");
+            }
+            await api("PUT", `/${resource}/${id}`, updateData);
+            msgSuccess("Запись успешно обновлена");
+            // Перезагружаем данные
+            await loadData(entity, paginationState[entity].currentPage, paginationState[entity].pageSize);
+            break;
+            
+          case "delete":
+            if (!id) throw new Error("Введите ID для удаления");
+            if (isNaN(Number(id))) {
+              throw new Error("ID должен быть числом");
+            }
+            if (!confirm(`Вы уверены, что хотите удалить запись с ID ${id}?`)) {
+              return;
+            }
+            await api("DELETE", `/${resource}/${id}`);
+            msgSuccess("Запись успешно удалена");
+            clearFields(entity, "upd_");
+            area.querySelector('[data-field="id"]').value = "";
+            // Перезагружаем данные
+            await loadData(entity, paginationState[entity].currentPage, paginationState[entity].pageSize);
+            break;
+        }
+      } catch (err) {
+        msgError(err.message || "Произошла неизвестная ошибка");
+      } finally {
+        setLoading(false);
+      }
+    };
+  });
+}
+
+// Инициализация приложения
+function init() {
+  const tabs = document.querySelectorAll('[data-entity]');
+  
+  function load(entity) {
+    document.getElementById("entityArea").innerHTML = renderPanel(entity);
+    attach(entity);
+    
+    // Загружаем первоначальные данные только для обычных сущностей
+    if (entity !== "queries") {
+      loadData(entity);
+    }
+  }
+  
+  // Загружаем первую вкладку по умолчанию
+  load("departments");
+  
+  // Обработчики переключения вкладок
+  tabs.forEach(tab => {
+    tab.onclick = () => {
+      tabs.forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      load(tab.dataset.entity);
+    };
+  });
+}
+
+// Запуск приложения после загрузки DOM
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

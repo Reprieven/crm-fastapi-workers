@@ -1,0 +1,1 @@
+CALL delete_record_by_id(%s,%s)

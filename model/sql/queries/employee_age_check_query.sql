@@ -1,0 +1,1 @@
+SELECT * FROM age_function(%s, %s)
